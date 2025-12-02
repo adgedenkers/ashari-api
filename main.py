@@ -84,7 +84,7 @@ async def receive_telegram_update(request: Request):
 
             elif "photo" in message:
                 photo = message["photo"][-1]
-                file_id = photo["file_id"]
+                file_id = photo["file_id"]   
                 file_info = requests.get(f"{TELEGRAM_API_URL}/getFile?file_id={file_id}").json()
                 file_path = file_info["result"]["file_path"]
 

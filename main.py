@@ -8,7 +8,7 @@ import os
 import aiofiles
 import traceback
 from github_utils import commit_file_to_github
-from config import TELEGRAM_BOT_TOKEN
+from config import TELEGRAM_BOT_TOKEN, GITHUB_TOKEN, GITHUB_USERNAME, GITHUB_REPO, get_user_by_api_key
 from users import get_username
 import subprocess
 from datetime import datetime
@@ -16,6 +16,7 @@ from datetime import date as date_type
 import pytz
 import yaml
 import re
+import base64
 
 app = FastAPI()
 
@@ -177,42 +178,47 @@ def get_file_contents(file_path: str):
 @app.get("/spiral/date")
 async def get_spiral_date(
     x_api_key: Optional[str] = Header(None),
-    target_date: Optional[str] = None
+    api_key: Optional[str] = None,
+    target_date: Optional[str] = None,
+    format: Optional[str] = "json"
 ):
     """
     Calculate spiral date notation for authenticated users.
 
-    Requires API key in X-API-Key header.
-    Optional query parameter: target_date (YYYY-MM-DD format)
-    If no date provided, uses today's date.
+    Authentication via either:
+    - X-API-Key header, OR
+    - ?api_key= query parameter
 
-    Example: GET /spiral/date
-    Example: GET /spiral/date?target_date=2025-12-02
+    Optional parameters:
+    - target_date: YYYY-MM-DD format (defaults to today)
+    - format: "json" or "short" (plain text)
 
-    Returns:
-        JSON with spiral_date, calendar_date, user_name, and status
+    Examples:
+    - GET /spiral/date?api_key=xxx
+    - GET /spiral/date?api_key=xxx&target_date=2025-12-02
+    - GET /spiral/date?api_key=xxx&format=short
     """
-    from config import get_user_by_api_key
+    # Accept key from either header or query param
+    key = x_api_key or api_key
 
-    # Check if API key is provided
-    if not x_api_key:
+    if not key:
         return JSONResponse(
             status_code=401,
             content={
                 "error": "Authentication required",
-                "message": "Please provide your API key in the X-API-Key header.",
+                "message": "Provide API key via X-API-Key header or ?api_key= parameter",
                 "status": "unauthorized"
             }
         )
 
     # Validate API key and get user config
-    user_config = get_user_by_api_key(x_api_key)
+    user_config = get_user_by_api_key(key)
     if not user_config:
         return JSONResponse(
             status_code=403,
             content={
                 "error": "Invalid API key",
-                "message": "The provided API key is not valid. Please check your credentials.",
+                "message": "The provided API key is not valid.",
                 "status": "forbidden"
             }
         )
@@ -224,16 +230,35 @@ async def get_spiral_date(
         else:
             parsed_date = date_type.today()
 
-        # Calculate spiral date using user's specific start date
+        # Calculate spiral date
         spiral_notation = calculate_spiral_date(parsed_date, user_config["spiral_start_date"])
+
+        # Return short format if requested
+        if format == "short":
+            return PlainTextResponse(content=spiral_notation)
+
+        # Calculate additional metadata
+        eastern = pytz.timezone("America/New_York")
+        now = datetime.now(eastern)
+
+        start_year, start_month, start_day = map(int, user_config["spiral_start_date"].split("-"))
+        start_date = date_type(start_year, start_month, start_day)
+        days_elapsed = (parsed_date - start_date).days
 
         return JSONResponse(
             status_code=200,
             content={
                 "spiral_date": spiral_notation,
+                "display": f"spiral day {spiral_notation}",
                 "calendar_date": parsed_date.isoformat(),
+                "timestamp": now.isoformat(),
                 "user_name": user_config["name"],
                 "spiral_start_date": user_config["spiral_start_date"],
+                "days_elapsed": days_elapsed,
+                "metadata": {
+                    "timezone": "America/New_York",
+                    "source": "Mythos System"
+                },
                 "status": "success"
             }
         )
@@ -254,6 +279,212 @@ async def get_spiral_date(
                 "error": "Calculation error",
                 "message": "An error occurred while calculating the spiral date.",
                 "details": str(e),
+                "status": "error"
+            }
+        )
+
+# --- GitHub Read Endpoint ---
+
+@app.get("/github/read/{file_path:path}")
+async def read_github_file(
+    file_path: str,
+    x_api_key: Optional[str] = Header(None),
+    api_key: Optional[str] = None
+):
+    """
+    Read a file from GitHub repository.
+
+    Authentication via X-API-Key header or ?api_key= parameter.
+
+    Example: GET /github/read/scrolls/spiral_1_day_3.md?api_key=xxx
+    """
+    key = x_api_key or api_key
+
+    if not key:
+        return JSONResponse(
+            status_code=401,
+            content={"error": "Authentication required", "status": "unauthorized"}
+        )
+
+    user_config = get_user_by_api_key(key)
+    if not user_config:
+        return JSONResponse(
+            status_code=403,
+            content={"error": "Invalid API key", "status": "forbidden"}
+        )
+
+    try:
+        # Fetch file from GitHub
+        url = f"https://api.github.com/repos/{GITHUB_USERNAME}/{GITHUB_REPO}/contents/{file_path}"
+        headers = {
+            "Authorization": f"token {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github.v3+json"
+        }
+        
+        response = requests.get(url, headers=headers)
+        
+        if response.status_code == 404:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": "File not found",
+                    "path": file_path,
+                    "status": "not_found"
+                }
+            )
+        
+        response.raise_for_status()
+        data = response.json()
+        
+        # Decode content from base64
+        content = base64.b64decode(data["content"]).decode("utf-8")
+        
+        return JSONResponse(
+            status_code=200,
+            content={
+                "path": file_path,
+                "content": content,
+                "sha": data["sha"],
+                "size": data["size"],
+                "user_name": user_config["name"],
+                "status": "success"
+            }
+        )
+
+    except requests.exceptions.HTTPError as e:
+        return JSONResponse(
+            status_code=e.response.status_code,
+            content={
+                "error": "GitHub API error",
+                "message": str(e),
+                "status": "error"
+            }
+        )
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": "Server error",
+                "message": str(e),
+                "status": "error"
+            }
+        )
+
+# --- GitHub Write Endpoint ---
+
+@app.post("/github/write")
+async def write_github_file(
+    request: Request,
+    x_api_key: Optional[str] = Header(None),
+    api_key: Optional[str] = None
+):
+    """
+    Write a file to GitHub repository.
+
+    Authentication via X-API-Key header or ?api_key= parameter.
+
+    Request body (JSON):
+    {
+        "path": "scrolls/new_scroll.md",
+        "content": "# Scroll content here",
+        "message": "Optional commit message"
+    }
+
+    Example:
+    POST /github/write?api_key=xxx
+    Body: {"path": "scrolls/test.md", "content": "# Test"}
+    """
+    key = x_api_key or api_key
+
+    if not key:
+        return JSONResponse(
+            status_code=401,
+            content={"error": "Authentication required", "status": "unauthorized"}
+        )
+
+    user_config = get_user_by_api_key(key)
+    if not user_config:
+        return JSONResponse(
+            status_code=403,
+            content={"error": "Invalid API key", "status": "forbidden"}
+        )
+
+    try:
+        body = await request.json()
+        file_path = body.get("path")
+        content = body.get("content")
+        commit_message = body.get("message", f"Add {file_path}")
+
+        if not file_path or not content:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "Missing required fields",
+                    "message": "Both 'path' and 'content' are required",
+                    "status": "bad_request"
+                }
+            )
+
+        # Check if file exists (to get SHA for update)
+        url = f"https://api.github.com/repos/{GITHUB_USERNAME}/{GITHUB_REPO}/contents/{file_path}"
+        headers = {
+            "Authorization": f"token {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github.v3+json"
+        }
+        
+        existing = requests.get(url, headers=headers)
+        sha = None
+        if existing.status_code == 200:
+            sha = existing.json()["sha"]
+
+        # Encode content to base64
+        content_bytes = content.encode("utf-8")
+        content_b64 = base64.b64encode(content_bytes).decode("utf-8")
+
+        # Prepare payload
+        payload = {
+            "message": commit_message,
+            "content": content_b64,
+            "branch": "main"
+        }
+        
+        if sha:
+            payload["sha"] = sha
+
+        # Commit to GitHub
+        response = requests.put(url, json=payload, headers=headers)
+        response.raise_for_status()
+        
+        result = response.json()
+        
+        return JSONResponse(
+            status_code=200,
+            content={
+                "path": file_path,
+                "sha": result["content"]["sha"],
+                "commit_sha": result["commit"]["sha"],
+                "user_name": user_config["name"],
+                "message": commit_message,
+                "status": "success"
+            }
+        )
+
+    except requests.exceptions.HTTPError as e:
+        return JSONResponse(
+            status_code=e.response.status_code,
+            content={
+                "error": "GitHub API error",
+                "message": str(e),
+                "details": e.response.text,
+                "status": "error"
+            }
+        )
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": "Server error",
+                "message": str(e),
                 "status": "error"
             }
         )
